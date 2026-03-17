@@ -1,0 +1,190 @@
+---
+title: "融合分析流程"
+author: "yqb"
+date: "`r format(Sys.time(), '%Y-%m-%d %H:%M %Z')`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    toc_depth: 2
+    number_sections: true
+    code_folding: show
+  word_document: default
+  pdf_document: default
+params:
+  # ===== 可配置参数 =====
+  links_file: "./model/9606.protein.links.v12.0.txt"
+  protein_info_file: "./model/9606.protein.info.v12.0.txt"
+  ppi_network_file: "./model/ppi_network.txt"
+  ppi_weights_file: "./model/ppi_weight.txt"
+  score_threshold: 700
+  gep_rds: "./data/sdy311.rds"
+  cellmarkers_csv: "./model/cellmarkers86.csv"
+  marker_weight: 0.5
+  networks_dir: "networks"
+  inter_path: "./model/surv_inter.csv"
+  jaccard_path: "./model/surv_jaccard.csv"
+  out_rds: "./result/sdy311_0.5_923.rds"
+  cores: 8
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  message = TRUE, warning = TRUE, error = FALSE,
+  echo = TRUE, fig.width = 7, fig.height = 5,
+  cache = TRUE
+)
+```
+
+# 介绍
+**R Markdown** 工作流，包含以下步骤：
+1. 读取并处理 **STRING** 数据库生成 PPI 网络；  
+2. 加载基因表达矩阵（GEP）并与 PPI 基因集求交集；  
+3. 基于 PPI 计算基因 **权重**（如 PageRank）；  
+4. 读取细胞标记基因并 **融合网络**（CrosstalkIn_PPI）；  
+5. 保存融合得分结果与运行信息。
+> 运行前请确保 `./model` 目录下的脚本存在：
+> - `process-string-ppi.r`
+> - `calculate-ppi-weights.r`
+> - `network_fusion.R`
+
+# 环境依赖
+
+```{r libraries}
+suppressPackageStartupMessages({
+  library(igraph)
+  library(parallel)
+  library(knitr)
+})
+```
+
+可选：如果您使用相对路径，建议在项目根目录 Knit；也可在此处设置工作目录：
+
+```{r, eval=FALSE}
+setwd("/path/to/your/project")
+```
+
+
+# 第 1 步：处理 STRING 数据库（提取 PPI 网络）
+
+```{r process-string, cache=TRUE}
+# 确保输出目录存在
+dir.create(dirname(params$ppi_network_file), showWarnings = FALSE, recursive = TRUE)
+dir.create(dirname(params$ppi_weights_file), showWarnings = FALSE, recursive = TRUE)
+dir.create(params$networks_dir, showWarnings = FALSE, recursive = TRUE)
+
+# 载入处理 STRING 的脚本
+source("./model/process-string-ppi.r")
+
+# 生成/读取 PPI 网络
+ppi_network <- process_string_ppi_dt(
+  links_file       = params$links_file,
+  protein_info_file= params$protein_info_file,
+  output_file      = params$ppi_network_file,
+  score_threshold  = params$score_threshold
+)
+
+# 基本信息
+nodes <- unique(c(ppi_network$gene1, ppi_network$gene2))
+cat("PPI 网络基本信息:\n")
+cat(sprintf("- 节点数量: %d\n", length(nodes)))
+cat(sprintf("- 边数量: %d\n", nrow(ppi_network)))
+cat(sprintf("- 平均权重: %.4f\n", mean(ppi_network$weight, na.rm = TRUE)))
+```
+
+# 第 2 步：加载基因表达矩阵并求交集
+
+```{r load-gep, cache=TRUE}
+GEP_obj <- readRDS(params$gep_rds)
+# 兼容两种常见结构：list(expr=...) 或 直接为矩阵
+GEP <- if (!is.null(GEP_obj$expr)) GEP_obj$expr else GEP_obj
+
+genes_in_expr <- rownames(GEP)
+genes_in_ppi  <- unique(c(ppi_network$gene1, ppi_network$gene2))
+common_genes  <- intersect(genes_in_expr, genes_in_ppi)
+
+cat("基因交集信息:\n")
+cat(sprintf("- 表达数据中的基因数: %d\n", length(genes_in_expr)))
+cat(sprintf("- PPI 网络中的基因数: %d\n", length(genes_in_ppi)))
+cat(sprintf("- 共有基因数: %d\n", length(common_genes)))
+cat(sprintf("- 交集比例: %.2f%%\n", 100 * length(common_genes) / length(genes_in_expr)))
+
+# 可选：将表达矩阵裁剪到公共基因（若后续需要）
+# GEP <- GEP[common_genes, , drop = FALSE]
+```
+
+# 第 3 步：计算 PPI 基因权重
+
+```{r ppi-weights, cache=TRUE}
+source("./model/calculate-ppi-weights.r")
+
+gene_weights <- calculate_ppi_weights(
+  PPI_network  = ppi_network,
+  gene_list    = genes_in_expr,     # 或使用 common_genes
+  output_file  = params$ppi_weights_file,
+  damping_factor = 0.85             # PageRank 默认重启概率
+)
+
+# 浏览前几行
+if (is.data.frame(gene_weights) || is.matrix(gene_weights)) {
+  head(gene_weights) %>% kable()
+} else {
+  str(gene_weights)
+}
+```
+
+# 第 4 步：读取细胞标记并融合网络
+
+```{r fusion, cache=TRUE}
+# 多核设置
+cores_to_use <- min(params$cores, max(1, parallel::detectCores() - 1))
+cat(sprintf("使用 %d 个 CPU 核心进行分析\n", cores_to_use))
+
+# 读取 cellmarkers 列表（行名为细胞类型，第一列为以逗号分隔的基因）
+cellmarkers_df <- read.csv(params$cellmarkers_csv, row.names = 1, header = FALSE, stringsAsFactors = FALSE)
+
+cell_markers <- list()
+for (cell_type in rownames(cellmarkers_df)) {
+  markers_str <- cellmarkers_df[cell_type, 1]
+  markers <- strsplit(markers_str, ",")[[1]]
+  markers <- trimws(markers)  # 去掉空格
+  cell_markers[[cell_type]] <- markers
+}
+
+# 加载融合函数
+source("./model/network_fusion.R")
+
+cat("开始计算网络融合得分...\n")
+fused_scores <- fuse_networks(
+  GEP             = GEP,
+  cell_markers    = cell_markers,
+  sample_names    = colnames(GEP),
+  marker_weight   = params$marker_weight,
+  networks_dir    = params$networks_dir,
+  ppi_weights_file= params$ppi_weights_file,
+  inter_path      = params$inter_path,
+  jacaard_path    = params$jaccard_path,
+  cl.cores        = cores_to_use
+)
+
+# 预览结果结构
+if (is.matrix(fused_scores) || is.data.frame(fused_scores)) {
+  cat("fused_scores 预览：\n")
+  head(fused_scores) %>% kable()
+} else {
+  str(fused_scores)
+}
+```
+
+# 第 5 步：保存结果
+
+```{r save, cache=FALSE}
+saveRDS(fused_scores, params$out_rds)
+cat(sprintf("已保存融合得分到：%s\n", params$out_rds))
+```
+
+# 复现实验信息
+
+```{r session-info}
+sessionInfo()
+```

@@ -1,0 +1,22 @@
+Package: CrosstalkIn
+Type: Package
+Title: Crosstalk-Aware Tumor Microenvironment Deconvolution
+Version: 0.1.0
+Author: Qianbei Yi
+Maintainer: Qianbei Yi <2112406034@e.gzhu.edu.cn>
+Description: Provides callable functions for the CrosstalkIn workflow,
+    including STRING PPI processing, PPI-based weight calculation,
+    and network fusion for crosstalk-aware tumor microenvironment
+    deconvolution.
+License: GPL-3
+Encoding: UTF-8
+Imports:
+    data.table,
+    igraph,
+    Matrix,
+    foreach,
+    doParallel
+Suggests:
+    progress
+RoxygenNote: 7.3.3
+
