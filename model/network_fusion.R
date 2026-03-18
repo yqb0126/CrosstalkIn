@@ -224,7 +224,11 @@ fuse_networks <- function(expr_networks = NULL, marker_networks = NULL,
       # 检查缓存
       expr_file <- file.path(networks_dir, paste0("expression_", sample, ".rds"))
       if (file.exists(expr_file)) {
-        return(readRDS(expr_file))
+        cached <- readRDS(expr_file)
+        if (!is.matrix(cached)) {
+          cached <- as.matrix(cached)
+        }
+        return(cached)
       }
 
       # 获取样本数据
@@ -260,7 +264,14 @@ fuse_networks <- function(expr_networks = NULL, marker_networks = NULL,
 
       # 计算最终矩阵
       matrix_weighted_genes <- weighted_score * matrix_cell_go_jaccard
-      expr_cell_matrix <- as.matrix(t(matrix_weighted_genes) %*% matrix_weighted_genes)
+      if (!(is.matrix(matrix_weighted_genes) || inherits(matrix_weighted_genes, "Matrix"))) {
+        stop(sprintf(
+          "expression network build failed for sample %s: matrix_weighted_genes is not a matrix (class=%s)",
+          sample, paste(class(matrix_weighted_genes), collapse = ",")
+        ))
+      }
+      expr_cell_matrix <- Matrix::crossprod(matrix_weighted_genes)
+      expr_cell_matrix <- as.matrix(expr_cell_matrix)
       expr_cell_matrix[is.na(expr_cell_matrix)] <- 0
       diag(expr_cell_matrix) <- 0
       # 归一化处理
